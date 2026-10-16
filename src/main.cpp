@@ -1,213 +1,225 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <TFT_eSPI.h>
+#include "painel.h"
+
 #include <Adafruit_NeoPixel.h>
-#include <math.h>
+#include <WiFi.h>
 
-static const int W = 240;
-static const int H = 320;
-static const int CX = 120;
-static const int CY = 150;
-static const int RADAR = 74;
+bool painelSujo = true;
 
-static const uint16_t BG = 0x0841;
+static Adafruit_NeoPixel rgb(1, 48, NEO_GRB + NEO_KHZ800);
+static int modoTela = TELA_DESCANSO;
+static uint32_t acordadoAte = 0;
+static bool pressionado = false;
+static int origemX = 0;
+static int origemY = 0;
+static int ultimoX = 0;
+static int ultimoY = 0;
+static int segundo = -1;
 
-TFT_eSPI tft;
-TFT_eSprite frame(&tft);
-Adafruit_NeoPixel rgb(1, 48, NEO_GRB + NEO_KHZ800);
+static void led(uint8_t r, uint8_t g, uint8_t b) {
+  rgb.setPixelColor(0, rgb.Color(r, g, b));
+  rgb.show();
+}
 
-struct Net {
-  char ssid[18];
-  int rssi;
+static int luzFixa = -1;
+static const uint8_t luzRgb[7][3] = {
+    {0, 0, 0}, {90, 6, 8}, {4, 55, 18}, {6, 18, 80}, {80, 48, 6}, {55, 8, 70}, {46, 46, 40},
 };
 
-static Net nets[4];
-static int netCount = 0;
-static bool scanning = false;
-static uint32_t lastScan = 0;
-static bool spriteOk = false;
-static uint32_t frames = 0;
-static uint32_t fpsStamp = 0;
-static int fps = 0;
-
-static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+void painelLuz(int cor) {
+  if (cor < -1) cor = -1;
+  if (cor > 6) cor = 6;
+  luzFixa = cor;
 }
 
-static void rememberNetworks(int found) {
-  netCount = 0;
-  if (found <= 0) return;
-  int idx[16];
-  int n = found < 16 ? found : 16;
-  for (int i = 0; i < n; i++) idx[i] = i;
-  for (int i = 0; i < n; i++) {
-    for (int j = i + 1; j < n; j++) {
-      if (WiFi.RSSI(idx[j]) > WiFi.RSSI(idx[i])) {
-        int tmp = idx[i];
-        idx[i] = idx[j];
-        idx[j] = tmp;
+int painelLuzAtual() { return luzFixa; }
+
+static void calibrar() {
+  if (aj.tOk) return;
+  pinMode(0, INPUT_PULLUP);
+  delay(900);
+  int passo = 0;
+  bool viuSolto = false;
+  int estavel = 0;
+  int guardadoX = 0;
+  int guardadoY = 0;
+  int zVisto = 0;
+  uiCalibrar(0, 0);
+  while (passo < 4) {
+    if (digitalRead(0) == LOW) {
+      delay(500);
+      if (digitalRead(0) == LOW) {
+        aj.tOk = 1;
+        aj.tX0 = 200;
+        aj.tX1 = 3800;
+        aj.tY0 = 200;
+        aj.tY1 = 3800;
+        aj.tTroca = 0;
+        ajustesSalvar();
+        return;
       }
     }
-  }
-  int keep = n < 4 ? n : 4;
-  for (int i = 0; i < keep; i++) {
-    String name = WiFi.SSID(idx[i]);
-    if (name.length() == 0) name = "(oculta)";
-    name.toCharArray(nets[i].ssid, sizeof(nets[i].ssid));
-    nets[i].rssi = WiFi.RSSI(idx[i]);
-    netCount++;
-  }
-}
-
-static void pollWifi() {
-  if (!scanning && millis() - lastScan > 7000) {
-    WiFi.scanNetworks(true);
-    scanning = true;
-    lastScan = millis();
-  }
-  int found = WiFi.scanComplete();
-  if (found >= 0) {
-    rememberNetworks(found);
-    WiFi.scanDelete();
-    scanning = false;
-  }
-}
-
-static void drawRadar(float sweep) {
-  uint16_t dim = rgb565(28, 64, 96);
-  uint16_t line = rgb565(120, 230, 255);
-  frame.drawCircle(CX, CY, RADAR, dim);
-  frame.drawCircle(CX, CY, RADAR * 2 / 3, dim);
-  frame.drawCircle(CX, CY, RADAR / 3, dim);
-  frame.drawLine(CX - RADAR, CY, CX + RADAR, CY, dim);
-  frame.drawLine(CX, CY - RADAR, CX, CY + RADAR, dim);
-
-  for (int i = 12; i >= 0; i--) {
-    float a = sweep - i * 0.09f;
-    uint8_t glow = (uint8_t)(255 - i * 18);
-    uint16_t color = rgb565(glow / 5, glow, glow);
-    int x2 = CX + (int)(cosf(a) * RADAR);
-    int y2 = CY + (int)(sinf(a) * RADAR);
-    frame.drawLine(CX, CY, x2, y2, i == 0 ? line : color);
-  }
-  frame.fillCircle(CX, CY, 3, line);
-
-  for (int i = 0; i < netCount; i++) {
-    float strength = (nets[i].rssi + 95) / 55.0f;
-    if (strength < 0.15f) strength = 0.15f;
-    if (strength > 1.0f) strength = 1.0f;
-    float ang = (i + 1) * 1.35f + 0.4f;
-    int px = CX + (int)(cosf(ang) * RADAR * strength);
-    int py = CY + (int)(sinf(ang) * RADAR * strength);
-    frame.fillCircle(px, py, 3, rgb565(255, 196, 80));
-  }
-}
-
-static void drawStars(float t) {
-  for (int i = 0; i < 28; i++) {
-    int x = (i * 47 + 13) % W;
-    int y = (i * 29 + 7) % 210;
-    float tw = 0.5f + 0.5f * sinf(t * 2.0f + i);
-    uint8_t v = (uint8_t)(40 + tw * 180);
-    frame.drawPixel(x, y, rgb565(v, v, v + 20));
-  }
-}
-
-static void drawPanel() {
-  frame.setTextFont(4);
-  frame.setTextColor(rgb565(245, 248, 255));
-  frame.setCursor(10, 6);
-  frame.print("Mario");
-
-  frame.setTextFont(2);
-  frame.setTextColor(rgb565(120, 220, 255));
-  frame.setCursor(148, 14);
-  frame.print("no ar");
-
-  frame.fillRect(0, 232, W, 88, rgb565(6, 10, 22));
-  frame.drawFastHLine(0, 232, W, rgb565(30, 70, 100));
-
-  frame.setTextFont(2);
-  if (netCount == 0) {
-    frame.setTextColor(rgb565(150, 170, 190));
-    frame.setCursor(10, 246);
-    frame.print(scanning ? "ouvindo o ar..." : "sem redes ainda");
-  } else {
-    for (int i = 0; i < netCount; i++) {
-      int y = 240 + i * 18;
-      frame.setTextColor(rgb565(230, 236, 245));
-      frame.setCursor(8, y);
-      frame.print(nets[i].ssid);
-      int bars = (nets[i].rssi + 100) / 12;
-      if (bars < 1) bars = 1;
-      if (bars > 5) bars = 5;
-      for (int b = 0; b < 5; b++) {
-        uint16_t c = b < bars ? rgb565(80, 220, 160) : rgb565(30, 40, 52);
-        frame.fillRect(196 + b * 8, y + 10 - b * 2, 5, 4 + b * 2, c);
+    int x = 0, y = 0, z = 0;
+    bool baixo = toqueBruto(x, y, z);
+    if (z != zVisto) {
+      zVisto = z;
+      uiCalibrar(passo, z);
+    }
+    if (!baixo) {
+      viuSolto = true;
+      if (estavel >= 5) {
+        toqueGuardarCanto(passo, guardadoX, guardadoY);
+        passo++;
+        estavel = 0;
+        viuSolto = false;
+        if (passo < 4) uiCalibrar(passo, 0);
+      } else {
+        estavel = 0;
       }
+      continue;
+    }
+    if (!viuSolto) continue;
+    if (estavel > 0 && abs(x - guardadoX) < 70 && abs(y - guardadoY) < 70) estavel++;
+    else estavel = 1;
+    guardadoX = x;
+    guardadoY = y;
+  }
+  if (!toqueFecharMapa()) {
+    aj.tX0 = 200;
+    aj.tX1 = 3800;
+    aj.tY0 = 200;
+    aj.tY1 = 3800;
+    aj.tTroca = 0;
+    aj.tOk = 1;
+  }
+  ajustesSalvar();
+}
+
+static void conectar() {
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname("painel");
+  if (aj.ssid[0]) {
+    uiBoot("conectando");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(aj.ssid, aj.senha);
+    uint32_t inicio = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - inicio < 18000) {
+      delay(200);
     }
   }
+  if (WiFi.status() == WL_CONNECTED) {
+    configTzTime("<-03>3", "pool.ntp.org", "time.nist.gov");
+    led(20, 50, 40);
+    Serial.print("ip ");
+    Serial.println(WiFi.localIP());
+    return;
+  }
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("Painel-N16R8");
+  led(50, 28, 0);
+  Serial.println("ap 192.168.4.1");
 }
 
-static void paint(float sweep) {
-  frame.fillSprite(BG);
-  drawStars(sweep);
-  drawRadar(sweep);
-  drawPanel();
-  frame.pushSprite(0, 0);
+static int telaAgora() {
+  if (WiFi.status() != WL_CONNECTED) return TELA_WIFI;
+  return modoTela;
 }
 
-static void ledFor(float sweep) {
-  uint16_t hue = (uint16_t)(fmodf(sweep, 6.28318f) / 6.28318f * 65535.0f);
-  rgb.setPixelColor(0, rgb.ColorHSV(hue, 230, 70));
-  rgb.show();
+static void acordar() { acordadoAte = millis() + (uint32_t)aj.cicloSeg * 1000UL; }
+
+static void gesto(int x, int y) {
+  int dx = x - origemX;
+  int dy = y - origemY;
+  bool deslizou = abs(dx) > 22 || abs(dy) > 22;
+  int tela = telaAgora();
+  if (tela == TELA_DESCANSO) {
+    modoTela = TELA_MENU;
+    acordar();
+    painelSujo = true;
+    return;
+  }
+  if (deslizou) {
+    if (tela != TELA_WIFI) acordar();
+    return;
+  }
+  int acao = uiToque(tela, origemX, origemY);
+  if (acao >= 0) {
+    modoTela = acao;
+    painelSujo = true;
+  }
+  if (modoTela != TELA_DESCANSO && tela != TELA_WIFI) acordar();
+}
+
+static void toqueTick() {
+  if (!aj.tOk) return;
+  int x = 0, y = 0, z = 0;
+  bool baixo = toqueLer(x, y, z);
+  if (baixo) {
+    if (!pressionado) {
+      origemX = x;
+      origemY = y;
+    }
+    ultimoX = x;
+    ultimoY = y;
+    pressionado = true;
+    return;
+  }
+  if (!pressionado) return;
+  pressionado = false;
+  gesto(ultimoX, ultimoY);
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
-  Serial.println("painel vivo");
-
   rgb.begin();
   rgb.setBrightness(40);
   rgb.clear();
   rgb.show();
-
-  tft.init();
-  tft.setRotation(0);
-  tft.fillScreen(BG);
-
-  frame.setColorDepth(16);
-  spriteOk = frame.createSprite(W, H) != nullptr;
-  if (!spriteOk) {
-    tft.setTextFont(4);
-    tft.setTextColor(TFT_WHITE, BG);
-    tft.setCursor(10, 40);
-    tft.print("Mario");
-    Serial.println("sprite falhou");
-  }
-
-  Serial.printf("psram %u flash ok\n", (unsigned)ESP.getPsramSize());
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  lastScan = millis() - 7000;
-  fpsStamp = millis();
+  ajustesCarregar();
+  uiIniciar();
+  toqueIniciar();
+  calibrar();
+  conectar();
+  webIniciar();
+  dadosAgendar();
+  acordar();
+  painelSujo = true;
+  Serial.println("painel pronto");
 }
 
 void loop() {
-  pollWifi();
-  float sweep = millis() / 450.0f;
-
-  if (spriteOk) {
-    paint(sweep);
+  webAtender();
+  int vista = telaAgora();
+  static int vistaAntes = -2;
+  if (vista != vistaAntes) {
+    dadosOlhar(vista);
+    vistaAntes = vista;
   }
-  ledFor(sweep);
+  dadosTick();
+  toqueTick();
 
-  frames++;
-  if (millis() - fpsStamp >= 2000) {
-    fps = frames / 2;
-    frames = 0;
-    fpsStamp = millis();
-    Serial.printf("vivo fps=%d redes=%d\n", fps, netCount);
+  int marca = (int)(millis() / 1000);
+  bool novoSegundo = marca != segundo;
+  if (novoSegundo) segundo = marca;
+
+  if (WiFi.status() == WL_CONNECTED && modoTela != TELA_DESCANSO && (int32_t)(millis() - acordadoAte) >= 0) {
+    modoTela = TELA_DESCANSO;
+    painelSujo = true;
+  }
+
+  static uint32_t radarQuadro = 0;
+  if (telaAgora() == TELA_RADAR && (int32_t)(millis() - radarQuadro) >= 90) {
+    radarQuadro = millis();
+    painelSujo = true;
+  }
+
+  int luz = painelLuzAtual();
+  if (luz >= 0) led(luzRgb[luz][0], luzRgb[luz][1], luzRgb[luz][2]);
+  else if (WiFi.status() == WL_CONNECTED) led(eNoite() ? 4 : 12, eNoite() ? 8 : 28, eNoite() ? 12 : 24);
+  else led(40, 22, 0);
+
+  if (painelSujo || novoSegundo) {
+    uiDesenhar(telaAgora());
+    painelSujo = false;
   }
 }
